@@ -1,0 +1,204 @@
+name: ZERO FAIL OpenWrt ABI Pipeline (AX6S)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      FW_VERSION: "25.12.2"
+      TARGET: mediatek
+      SUBTARGET: mt7622
+
+    steps:
+
+      # =========================
+      # 1. CORE TOOLS
+      # =========================
+      - name: Install tools
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git curl wget \
+            unzip zip zstd file sshpass
+
+      # =========================
+      # 2. ABI SOURCE (SAFE MODE)
+      # =========================
+      - name: Get kernel ABI (router or fallback)
+        run: |
+          set -e
+
+          if [ -n "${{ secrets.ROUTER_HOST }}" ]; then
+            RAW=$(sshpass -p "${{ secrets.ROUTER_PASS }}" ssh -o StrictHostKeyChecking=no \
+              ${{ secrets.ROUTER_USER }}@${{ secrets.ROUTER_HOST }} \
+              "cat /proc/version; uname -r")
+          else
+            RAW="6.12.74 09da6f8026836be755e675b8c6a70b8b-r1"
+          fi
+
+          echo "$RAW"
+
+          KVER=$(echo "$RAW" | grep -oE '6\.[0-9]+\.[0-9]+' | head -n1)
+          KHASH=$(echo "$RAW" | grep -oE '[a-f0-9]{12,}' | head -n1)
+
+          if [ -z "$KVER" ]; then
+            echo "ERROR: kernel version missing"
+            exit 1
+          fi
+
+          if [ -z "$KHASH" ]; then
+            KHASH="nohash"
+          fi
+
+          echo "KVER=$KVER" >> $GITHUB_ENV
+          echo "KHASH=$KHASH" >> $GITHUB_ENV
+
+      # =========================
+      # 3. SDK RESOLUTION (STRICT)
+      # =========================
+      - name: Resolve OpenWrt SDK
+        run: |
+          set -e
+
+          BASE="https://downloads.openwrt.org/releases/${FW_VERSION}/targets/${TARGET}/${SUBTARGET}/"
+
+          echo "Fetching SDK list..."
+
+          SDK=$(curl -fsSL "$BASE" | grep -oE 'openwrt-sdk-[^"]+\.tar\.(xz|zst)' | head -n1)
+
+          if [ -z "$SDK" ]; then
+            echo "ERROR: SDK not found"
+            exit 1
+          fi
+
+          echo "SDK=$SDK"
+          wget -q "${BASE}${SDK}"
+
+          if [[ "$SDK" == *.tar.zst ]]; then
+            tar --zstd -xf "$SDK"
+          else
+            tar -xf "$SDK"
+          fi
+
+      # =========================
+      # 4. DETECT SDK DIR
+      # =========================
+      - name: Detect SDK
+        run: |
+          set -e
+
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*")
+
+          if [ -z "$SDK_DIR" ]; then
+            echo "ERROR: SDK missing"
+            exit 1
+          fi
+
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+
+      # =========================
+      # 5. ABI GUARD (CRITICAL)
+      # =========================
+      - name: ABI Guard
+        run: |
+          set -e
+
+          echo "Kernel: $KVER"
+          echo "Hash: $KHASH"
+
+          if [[ "$KVER" != "6.12.74" ]]; then
+            echo "ABI FAIL: unsupported kernel version"
+            exit 1
+          fi
+
+      # =========================
+      # 6. FEEDS
+      # =========================
+      - name: Feeds
+        run: |
+          set -e
+          cd "$SDK_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # =========================
+      # 7. PACKAGES
+      # =========================
+      - name: Add packages
+        run: |
+          set -e
+          cp -r kmod-amneziawg "$SDK_DIR/package/" || exit 1
+          cp -r amneziawg-tools "$SDK_DIR/package/" || exit 1
+          cp -r luci-proto-amneziawg "$SDK_DIR/package/" || exit 1
+
+      # =========================
+      # 8. CONFIG
+      # =========================
+      - name: Config
+        run: |
+          set -e
+          cd "$SDK_DIR"
+
+          echo "CONFIG_PACKAGE_kmod-amneziawg=m" > .config
+          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
+          echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-amneziawg-ru=y" >> .config
+
+          make defconfig
+
+      # =========================
+      # 9. BUILD (STRICT FAIL FAST)
+      # =========================
+      - name: Build
+        run: |
+          set -e
+          cd "$SDK_DIR"
+
+          make package/kmod-amneziawg/compile V=s
+          make package/amneziawg-tools/compile V=s
+          make package/luci-proto-amneziawg/compile V=s
+
+      # =========================
+      # 10. COLLECT ARTIFACTS
+      # =========================
+      - name: Collect
+        run: |
+          set -e
+
+          mkdir -p release
+
+          find "$SDK_DIR/bin" -type f \( -name "*.apk" -o -name "*.ipk" \) -exec cp {} release/ \;
+
+          if [ -z "$(ls -A release)" ]; then
+            echo "ERROR: no artifacts"
+            exit 1
+          fi
+
+      # =========================
+      # 11. SAFE TAG BUILDER (FIXED)
+      # =========================
+      - name: Build safe tag
+        run: |
+          set -e
+
+          SAFE_TAG="abi-${KVER}-${KHASH}"
+          SAFE_TAG=$(echo "$SAFE_TAG" | tr -cd 'a-zA-Z0-9.-')
+
+          echo "TAG=$SAFE_TAG" >> $GITHUB_ENV
+          echo "Release tag: $SAFE_TAG"
+
+      # =========================
+      # 12. RELEASE (NO FAIL)
+      # =========================
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: release/*
