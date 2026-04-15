@@ -1,4 +1,4 @@
-name: OpenWrt AX6S Ultra Build
+name: OpenWrt AX6S Ultra Build 12
 
 on:
   workflow_dispatch:
