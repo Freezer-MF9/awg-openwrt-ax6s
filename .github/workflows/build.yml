@@ -1,1 +1,129 @@
+name: Build AmneziaWG AX6S
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      TARGET: mediatek
+      SUBTARGET: mt7622
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gettext \
+            git \
+            libncurses5-dev \
+            libssl-dev \
+            python3 \
+            python3-pyelftools \
+            rsync \
+            unzip \
+            zlib1g-dev \
+            wget \
+            curl \
+            file \
+            zstd
+
+      - name: Download OpenWrt SDK
+        run: |
+          URL="https://downloads.openwrt.org/snapshots/targets/${TARGET}/${SUBTARGET}/"
+
+          SDK_FILE=$(curl -fsSL "$URL" | grep -oE 'openwrt-sdk-[^"]+\.tar\.(xz|zst)' | head -n1)
+
+          if [ -z "$SDK_FILE" ]; then
+            echo "SDK not found"
+            exit 1
+          fi
+
+          echo "Downloading $SDK_FILE"
+          wget -q "${URL}${SDK_FILE}"
+
+          if [[ "$SDK_FILE" == *.tar.zst ]]; then
+            tar --zstd -xf "$SDK_FILE"
+          else
+            tar -xf "$SDK_FILE"
+          fi
+
+      - name: Prepare SDK
+        run: |
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n1)
+
+          if [ -z "$SDK_DIR" ]; then
+            echo "SDK directory not found"
+            exit 1
+          fi
+
+          cd "$SDK_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Copy package sources
+        run: |
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n1)
+
+          if [ -d kmod-amneziawg ]; then
+            cp -r kmod-amneziawg "$SDK_DIR/package/"
+          fi
+
+          if [ -d amneziawg-tools ]; then
+            cp -r amneziawg-tools "$SDK_DIR/package/"
+          fi
+
+          if [ -d luci-proto-amneziawg ]; then
+            cp -r luci-proto-amneziawg "$SDK_DIR/package/"
+          fi
+
+      - name: Configure build
+        run: |
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n1)
+          cd "$SDK_DIR"
+
+          echo "CONFIG_PACKAGE_kmod-amneziawg=m" > .config
+          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
+          echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-amneziawg-ru=y" >> .config
+
+          make defconfig
+
+      - name: Build packages
+        run: |
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n1)
+          cd "$SDK_DIR"
+
+          make package/kmod-amneziawg/compile V=s -j"$(nproc)" || true
+          make package/amneziawg-tools/compile V=s -j"$(nproc)" || true
+          make package/luci-proto-amneziawg/compile V=s -j"$(nproc)" || true
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p release
+
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n1)
+
+          find "$SDK_DIR/bin/" -type f -name "*.ipk" -exec cp {} release/ \; || true
+
+          ls -lah release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: amneziawg-ax6s
+          path: release/*
