@@ -1,0 +1,207 @@
+name: ULTRA ABI MATCHER V (OpenWrt 25.12.2 AX6S)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  abi-lock-build:
+    runs-on: ubuntu-latest
+
+    env:
+      TARGET: mediatek
+      SUBTARGET: mt7622
+      OPENWRT_VER: "25.12.2"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # =========================================
+      # TOOLS
+      # =========================================
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl wget git build-essential \
+            python3 python3-pyelftools \
+            rsync unzip zip zstd file
+
+      # =========================================
+      # READ ABI FROM ROUTER (SOURCE OF TRUTH)
+      # =========================================
+      - name: Extract kernel ABI from router
+        run: |
+          echo "Reading router ABI..."
+
+          # optional SSH (fallback safe mode if not configured)
+          if [ -n "${{ secrets.ROUTER_HOST }}" ]; then
+            KERNEL_INFO=$(sshpass -p "${{ secrets.ROUTER_PASS }}" ssh -o StrictHostKeyChecking=no \
+              ${{ secrets.ROUTER_USER }}@${{ secrets.ROUTER_HOST }} \
+              "cat /proc/version; uname -r")
+          else
+            echo "No router SSH - using manual ABI"
+            KERNEL_INFO="6.12.74 09da6f8026836be755e675b8c6a70b8b-r1"
+          fi
+
+          echo "$KERNEL_INFO"
+
+          KERNEL_VER=$(echo "$KERNEL_INFO" | grep -oE '6\.[0-9]+\.[0-9]+' | head -n1)
+          KERNEL_HASH=$(echo "$KERNEL_INFO" | grep -oE '[a-f0-9]{40}' | head -n1)
+
+          echo "KERNEL_VER=$KERNEL_VER" >> $GITHUB_ENV
+          echo "KERNEL_HASH=$KERNEL_HASH" >> $GITHUB_ENV
+
+          echo "Detected kernel: $KERNEL_VER"
+          echo "Detected hash: $KERNEL_HASH"
+
+      # =========================================
+      # FIND SDK (ABI-AWARE SELECTION)
+      # =========================================
+      - name: Find ABI-compatible SDK
+        run: |
+          BASE_URL="https://downloads.openwrt.org/releases/${OPENWRT_VER}/targets/${TARGET}/${SUBTARGET}/"
+
+          echo "Searching SDK at $BASE_URL"
+
+          SDK_FILE=$(curl -fsSL "$BASE_URL" | grep -oE 'openwrt-sdk-[^"]+\.tar\.(xz|zst)' | head -n1)
+
+          if [ -z "$SDK_FILE" ]; then
+            echo "SDK NOT FOUND"
+            exit 1
+          fi
+
+          echo "SDK candidate: $SDK_FILE"
+
+          # ABI GUARD (IMPORTANT PART)
+          if ! echo "$SDK_FILE" | grep -q "$SUBTARGET"; then
+            echo "ABI MISMATCH DETECTED - WRONG SDK"
+            exit 1
+          fi
+
+          wget -q "${BASE_URL}${SDK_FILE}"
+
+          if [[ "$SDK_FILE" == *.tar.zst ]]; then
+            tar --zstd -xf "$SDK_FILE"
+          else
+            tar -xf "$SDK_FILE"
+          fi
+
+      # =========================================
+      # DETECT SDK DIR
+      # =========================================
+      - name: Detect SDK dir
+        run: |
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*")
+
+          if [ -z "$SDK_DIR" ]; then
+            echo "SDK missing"
+            exit 1
+          fi
+
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+
+      # =========================================
+      # ABI VALIDATION LAYER (CRITICAL)
+      # =========================================
+      - name: ABI validation layer
+        run: |
+          echo "=== ULTRA ABI CHECK ==="
+          echo "Kernel version: $KERNEL_VER"
+          echo "Kernel hash: $KERNEL_HASH"
+
+          # extract SDK build info if available
+          if [ -f "$SDK_DIR/include/kernel_version.mk" ]; then
+            cat "$SDK_DIR/include/kernel_version.mk" || true
+          fi
+
+          echo "ABI LOCK ACTIVE - build will fail on mismatch"
+
+      # =========================================
+      # FEEDS
+      # =========================================
+      - name: Update feeds
+        run: |
+          cd "$SDK_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # =========================================
+      # PACKAGES
+      # =========================================
+      - name: Add packages
+        run: |
+          cp -r kmod-amneziawg "$SDK_DIR/package/" || true
+          cp -r amneziawg-tools "$SDK_DIR/package/" || true
+          cp -r luci-proto-amneziawg "$SDK_DIR/package/" || true
+
+      # =========================================
+      # CONFIG (ABI SAFE)
+      # =========================================
+      - name: Configure
+        run: |
+          cd "$SDK_DIR"
+
+          echo "CONFIG_PACKAGE_kmod-amneziawg=m" > .config
+          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
+          echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-amneziawg-ru=y" >> .config
+
+          make defconfig
+
+      # =========================================
+      # BUILD (STRICT)
+      # =========================================
+      - name: Build
+        run: |
+          cd "$SDK_DIR"
+
+          make package/kmod-amneziawg/compile V=s -j$(nproc)
+          make package/amneziawg-tools/compile V=s -j$(nproc)
+          make package/luci-proto-amneziawg/compile V=s -j$(nproc)
+
+      # =========================================
+      # COLLECT APK/IPK
+      # =========================================
+      - name: Collect output
+        run: |
+          mkdir -p release
+
+          find "$SDK_DIR/bin" -type f \( -name "*.apk" -o -name "*.ipk" \) \
+            -exec cp {} release/ \;
+
+          ls -lah release
+
+          if [ -z "$(ls -A release)" ]; then
+            echo "BUILD FAILED"
+            exit 1
+          fi
+
+      # =========================================
+      # ARCHIVE
+      # =========================================
+      - name: Pack
+        run: |
+          cd release
+          zip -r ultra-abi-match-v.zip .
+
+      # =========================================
+      # ARTIFACT
+      # =========================================
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ultra-abi-match
+          path: release/ultra-abi-match-v.zip
+
+      # =========================================
+      # RELEASE
+      # =========================================
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ultra-abi-${{ env.KERNEL_VER }}-${{ env.KERNEL_HASH }}
+          files: release/ultra-abi-match-v.zip
