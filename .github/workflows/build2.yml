@@ -61,8 +61,8 @@ jobs:
           cp -r amneziawg-tools $SDK_DIR/package/
           cp -r luci-proto-amneziawg $SDK_DIR/package/
 
-      - name: Configure
-        run: |
+- name: Configure
+  run: |
           SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*")
 
           cd "$SDK_DIR"
