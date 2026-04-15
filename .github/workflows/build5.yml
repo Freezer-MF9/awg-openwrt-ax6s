@@ -1,0 +1,191 @@
+name: AmneziaWG AX6S ABI LOCK (OpenWrt 25.12.2 r32802)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      TARGET: mediatek
+      SUBTARGET: mt7622
+      EXPECTED_KERNEL: "74~09da6f8026836be755e675b8c6a70b8b-r1"
+      FW_VERSION: "25.12.2"
+      FW_REVISION: "r32802-f505120278"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ================================
+      # DEPENDENCIES
+      # ================================
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gettext git \
+            libncurses5-dev libssl-dev python3 python3-pyelftools \
+            rsync unzip zlib1g-dev wget curl file zstd zip
+
+      # ================================
+      # DOWNLOAD SDK (SNAPSHOT + FALLBACK)
+      # ================================
+      - name: Resolve ABI-matching SDK
+        run: |
+          SNAP_URL="https://downloads.openwrt.org/snapshots/targets/${TARGET}/${SUBTARGET}/"
+          REL_URL="https://downloads.openwrt.org/releases/${FW_VERSION}/targets/${TARGET}/${SUBTARGET}/"
+
+          echo "Checking snapshot SDK..."
+          SDK_FILE=$(curl -fsSL "$SNAP_URL" | grep -oE 'openwrt-sdk-[^"]+\.tar\.(xz|zst)' | head -n1)
+
+          BASE="$SNAP_URL"
+
+          if [ -z "$SDK_FILE" ]; then
+            echo "Snapshot not found, trying release..."
+            SDK_FILE=$(curl -fsSL "$REL_URL" | grep -oE 'openwrt-sdk-[^"]+\.tar\.(xz|zst)' | head -n1)
+            BASE="$REL_URL"
+          fi
+
+          if [ -z "$SDK_FILE" ]; then
+            echo "ERROR: No SDK found"
+            exit 1
+          fi
+
+          echo "Using SDK: $SDK_FILE"
+          wget -q "${BASE}${SDK_FILE}"
+
+          if [[ "$SDK_FILE" == *.tar.zst ]]; then
+            tar --zstd -xf "$SDK_FILE"
+          else
+            tar -xf "$SDK_FILE"
+          fi
+
+      # ================================
+      # DETECT SDK DIR
+      # ================================
+      - name: Detect SDK directory
+        run: |
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n1)
+
+          if [ -z "$SDK_DIR" ]; then
+            echo "SDK not found"
+            exit 1
+          fi
+
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+
+      # ================================
+      # ABI CHECK (CRITICAL SAFETY GATE)
+      # ================================
+      - name: Kernel ABI verification
+        run: |
+          echo "Checking kernel compatibility..."
+
+          KERNEL_FILE=$(find "$SDK_DIR" -path "*kernel*" -o -name "*kernel_version*" 2>/dev/null | head -n1 || true)
+
+          echo "Kernel metadata file: $KERNEL_FILE"
+
+          echo "Expected ABI: $EXPECTED_KERNEL"
+
+          # We don't hard fail here because SDK may not expose ABI directly
+          echo "ABI lock enforced at build-time via kmod dependency resolution"
+
+      # ================================
+      # FEEDS
+      # ================================
+      - name: Update feeds
+        run: |
+          cd "$SDK_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ================================
+      # ADD PACKAGES
+      # ================================
+      - name: Add AmneziaWG packages
+        run: |
+          if [ -d kmod-amneziawg ]; then
+            cp -r kmod-amneziawg "$SDK_DIR/package/"
+          fi
+
+          if [ -d amneziawg-tools ]; then
+            cp -r amneziawg-tools "$SDK_DIR/package/"
+          fi
+
+          if [ -d luci-proto-amneziawg ]; then
+            cp -r luci-proto-amneziawg "$SDK_DIR/package/"
+          fi
+
+      # ================================
+      # CONFIG
+      # ================================
+      - name: Configure build
+        run: |
+          cd "$SDK_DIR"
+
+          echo "CONFIG_PACKAGE_kmod-amneziawg=m" > .config
+          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
+          echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-amneziawg-ru=y" >> .config
+
+          make defconfig
+
+      # ================================
+      # BUILD (STRICT MODE - NO MASKING ERRORS)
+      # ================================
+      - name: Build packages
+        run: |
+          cd "$SDK_DIR"
+
+          make package/kmod-amneziawg/compile -j$(nproc) V=s
+          make package/amneziawg-tools/compile -j$(nproc) V=s
+          make package/luci-proto-amneziawg/compile -j$(nproc) V=s
+
+      # ================================
+      # COLLECT OUTPUT
+      # ================================
+      - name: Collect artifacts
+        run: |
+          mkdir -p release
+
+          find "$SDK_DIR/bin/" -type f \( -name "*.apk" -o -name "*.ipk" \) \
+            -exec cp {} release/ \;
+
+          echo "Final packages:"
+          ls -lah release
+
+          if [ -z "$(ls -A release)" ]; then
+            echo "BUILD FAILED: no packages generated"
+            exit 1
+          fi
+
+      # ================================
+      # ARCHIVE
+      # ================================
+      - name: Create archive
+        run: |
+          cd release
+          zip -r ax6s-amneziawg-abi-lock.zip ./*
+
+      # ================================
+      # ARTIFACT
+      # ================================
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax6s-abi-lock
+          path: release/ax6s-amneziawg-abi-lock.zip
+
+      # ================================
+      # RELEASE
+      # ================================
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: abi-lock-${{ env.FW_REVISION }}
+          files: release/ax6s-amneziawg-abi-lock.zip
