@@ -61,17 +61,18 @@ jobs:
           cp -r amneziawg-tools $SDK_DIR/package/
           cp -r luci-proto-amneziawg $SDK_DIR/package/
 
-- name: Configure
-  run: |
-    SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*")
-    cd "$SDK_DIR"
+      - name: Configure
+        run: |
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*")
 
-    echo "CONFIG_PACKAGE_kmod-amneziawg=m" > .config
-    echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
-    echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
-    echo "CONFIG_PACKAGE_luci-i18n-amneziawg-ru=y" >> .config
+          cd "$SDK_DIR"
 
-    make defconfig
+echo "CONFIG_PACKAGE_kmod-amneziawg=m" > .config
+echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
+echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
+echo "CONFIG_PACKAGE_luci-i18n-amneziawg-ru=y" >> .config
+
+          make defconfig
 
       - name: Build packages
         run: |
