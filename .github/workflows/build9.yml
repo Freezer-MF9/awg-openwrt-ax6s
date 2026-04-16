@@ -32,8 +32,8 @@ jobs:
       # =========================
       # GET SDK (ABI LOCK SAFE)
       # =========================================
-- name: Detect SDK dir
-        run: |
+      - name: Detect SDK dir
+  run: |
           set -e
           BASE_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/${TARGET}/${SUBTARGET}"
           # Add the rest of your logic here
